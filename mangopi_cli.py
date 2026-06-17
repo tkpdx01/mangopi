@@ -35,6 +35,17 @@ MANGO_API_URL = os.environ.get("MANGO_API_URL", "https://api.deepseek.com")
 MANGO_MODEL = os.environ.get("MANGO_MODEL", "deepseek-v4-flash")
 MANGO_MAX_CONTEXT = int(os.environ.get("MANGO_MAX_CONTEXT", 1_000_000))
 MANGO_MAX_ITER = int(os.environ.get("MANGO_MAX_ITER", 100))
+MANGO_MAX_OUTPUT = int(os.environ.get("MANGO_MAX_OUTPUT", 0) or 0)
+MANGO_TEMPERATURE = os.environ.get("MANGO_TEMPERATURE")
+MANGO_TOP_P = os.environ.get("MANGO_TOP_P")
+MANGO_TOOL_CHOICE = os.environ.get("MANGO_TOOL_CHOICE")
+MANGO_DISABLE_TOOLS = os.environ.get("MANGO_DISABLE_TOOLS", "")
+MANGO_OFFLINE = os.environ.get("MANGO_OFFLINE", "").lower() in ("1", "true", "yes", "on")
+MANGO_READ_DEFAULT_LIMIT = int(os.environ.get("MANGO_READ_DEFAULT_LIMIT", 0) or 0)
+MANGO_GREP_MAX_HITS = int(os.environ.get("MANGO_GREP_MAX_HITS", 500) or 500)
+MANGO_BASH_MAX_LINES = int(os.environ.get("MANGO_BASH_MAX_LINES", 1000) or 1000)
+MANGO_REQUEST_TIMEOUT = int(os.environ.get("MANGO_REQUEST_TIMEOUT", 300) or 300)
+MANGO_REQUEST_RETRIES = int(os.environ.get("MANGO_REQUEST_RETRIES", 3) or 3)
 LANGUAGE = os.environ.get("MANGO_LANG", "en").lower()
 
 
@@ -58,6 +69,7 @@ I18N = {
         "tool.result.fail": "执行失败",
         "llm.thinking": "思考中",
         "llm.output": "输出",
+        "llm.confirmation": "确认",
         "context.compact": "上下文压缩",
         "context.compact.strategy": "策略",
         "context.round": "轮次",
@@ -84,6 +96,7 @@ I18N = {
         "tool.result.fail": "Execution failed",
         "llm.thinking": "Thinking",
         "llm.output": "Output",
+        "llm.confirmation": "Confirmation",
         "context.compact": "Context compact",
         "context.compact.strategy": "Strategy",
         "context.round": "round",
@@ -174,6 +187,11 @@ class Printer:
 
     def output(self, content: str):
         self.section(_i18n("llm.output"))
+        for line in content.splitlines():
+            self._write_line("  " + _c(line, SOFT))
+
+    def confirmation(self, content: str):
+        self.section(_i18n("llm.confirmation"))
         for line in content.splitlines():
             self._write_line("  " + _c(line, SOFT))
 
@@ -281,6 +299,21 @@ FILTERED_DIRS = [
     ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next", ".turbo", ".idea",
     ".vscode", ".mypy_cache", ".pytest_cache", ".cache", "target", "vendor"]
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+IMAGE_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _configured_disabled_tools() -> set:
+    names = {x.strip() for x in MANGO_DISABLE_TOOLS.split(",") if x.strip()}
+    if MANGO_OFFLINE:
+        names.add("web_search")
+    names.discard("attempt_completion")
+    return names
 
 
 def _is_directory_heavy(command: str) -> bool:  # 判断是否是目录遍历类命令
@@ -314,7 +347,7 @@ def _process_bash_output(command: str, output: List[str]) -> List[str]:
         return output
     if _is_directory_heavy(command):
         output = _filter_directory_output(output)
-    output = _limit_output_lines(output)
+    output = _limit_output_lines(output, MANGO_BASH_MAX_LINES)
     return output
 
 
@@ -354,9 +387,11 @@ def _validate_file_path(path: str) -> Optional[str]:
     return None
 
 
-def _request(url: str, body: dict, headers: dict = None, timeout: int = 300, max_retries: int = 3) -> dict:
+def _request(url: str, body: dict, headers: dict = None, timeout: int = None, max_retries: int = None) -> dict:
     last_exception = None
     headers = headers or {"Content-Type": "application/json"}
+    timeout = MANGO_REQUEST_TIMEOUT if timeout is None else timeout
+    max_retries = MANGO_REQUEST_RETRIES if max_retries is None else max_retries
     for attempt in range(max_retries + 1):
         try:
             request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
@@ -625,13 +660,23 @@ class ReadTool(ToolBase):
     def run(self, args):
         path = args["path"]
         ext = os.path.splitext(path)[1].lower()
-        if ext in IMAGE_EXTS and "offset" not in args and "limit" not in args:
+        if (ext in IMAGE_EXTS and "view_image" not in _configured_disabled_tools()
+                and "offset" not in args and "limit" not in args):
             return ViewImageTool().run({"path": path})
         with open(path) as f:
             lines = f.readlines()
-        offset, limit = args.get("offset", 0), args.get("limit", len(lines))
+        offset = int(args.get("offset", 0) or 0)
+        if args.get("limit") is not None:
+            limit = int(args["limit"])
+        elif MANGO_READ_DEFAULT_LIMIT > 0:
+            limit = MANGO_READ_DEFAULT_LIMIT
+        else:
+            limit = len(lines)
         selected = lines[offset: offset + limit]
-        return self.ok("".join(f"{offset + idx + 1:4}| {line}" for idx, line in enumerate(selected)))
+        content = "".join(f"{offset + idx + 1:4}| {line}" for idx, line in enumerate(selected))
+        if offset + len(selected) < len(lines):
+            content += f"\n... truncated {len(lines) - offset - len(selected)} lines ..."
+        return self.ok(content)
 
 
 class WriteTool(ToolBase):
@@ -728,7 +773,7 @@ class GrepTool(ToolBase):
                         hits.append(f"{filepath}:{line_num}:{line.rstrip()}")
             except Exception:
                 continue
-        return self.ok("\n".join(hits[:500]) or "none")
+        return self.ok("\n".join(hits[:MANGO_GREP_MAX_HITS]) or "none")
 
 
 class BashTool(ToolBase):
@@ -1033,7 +1078,9 @@ class ViewImageTool(ToolBase):
                 b64 = base64.b64encode(f.read()).decode("ascii")
         except OSError as e:
             return self.fail(f"view_image error: cannot read file: {e}")
-        mime, _ = mimetypes.guess_type(path)
+        mime = IMAGE_MIME_BY_EXT.get(ext)
+        if not mime:
+            mime, _ = mimetypes.guess_type(path)
         if not mime:
             mime = "image/png"
         data_uri = f"data:{mime};base64,{b64}"
@@ -1051,11 +1098,19 @@ class AttemptCompletionTool(ToolBase):
         return self.ok(args["result"])
 
 
-TOOLS = {
-    t.name: t for t in [
+def _disabled_tools() -> set:
+    return _configured_disabled_tools()
+
+
+def _build_tools() -> Dict[str, ToolBase]:
+    disabled = _disabled_tools()
+    tools = [
         ReadTool(), WriteTool(), EditTool(), SearchTool(), GrepTool(), BashTool(), UseSkillTool(),
         SearchMemoryTool(), AppendMemoryTool(), GoalTool(), WebSearchTool(), ViewImageTool(), AttemptCompletionTool()]
-}
+    return {t.name: t for t in tools if t.name not in disabled}
+
+
+TOOLS = _build_tools()
 
 
 def tool_schema():
@@ -1373,6 +1428,36 @@ class BaseProvider:
     def parse_response(self, response: Dict[str, Any]) -> Dict[str, Any]: raise NotImplementedError
 
     @staticmethod
+    def clean_tagged_content(content: str, reasoning: str = "") -> Dict[str, str]:
+        content = content or ""
+        reasoning_parts = [reasoning] if reasoning else []
+
+        def collect_think(match):
+            text = (match.group(1) or "").strip()
+            if text:
+                reasoning_parts.append(text)
+            return ""
+
+        content = re.sub(r"(?is)<think>\s*(.*?)\s*</think>", collect_think, content)
+
+        confirmations = []
+
+        def collect_confirmation(match):
+            text = (match.group(1) or "").strip()
+            if text:
+                confirmations.append(text)
+            return text
+
+        content = re.sub(r"(?is)<confirmation>\s*(.*?)\s*</confirmation>", collect_confirmation, content)
+        content = re.sub(r"(?is)</?confirmation>", "", content)
+        content = re.sub(r"(?is)</?think>", "", content)
+        return {
+            "content": content.strip(),
+            "reasoning_content": "\n\n".join(x for x in reasoning_parts if x).strip(),
+            "confirmation_content": "\n\n".join(confirmations).strip(),
+        }
+
+    @staticmethod
     def normalize_tool_calls(message: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_tool_calls = message.get("tool_calls") or []
         if not raw_tool_calls and message.get("function_call"):  # OpenAI old function_call fallback
@@ -1381,15 +1466,25 @@ class BaseProvider:
             return []
 
         tool_calls = []
-        for tc in raw_tool_calls:
+        for idx, tc in enumerate(raw_tool_calls):
+            if isinstance(tc, str):
+                try:
+                    tc = json.loads(tc)
+                except json.JSONDecodeError:
+                    continue
             function = tc.get("function", {})
+            if isinstance(function, str):
+                try:
+                    function = json.loads(function)
+                except json.JSONDecodeError:
+                    function = {}
             args_str = function.get("arguments", "{}")
             try:
-                arguments = json.loads(args_str) if args_str else {}
+                arguments = json.loads(args_str) if isinstance(args_str, str) and args_str else args_str or {}
             except json.JSONDecodeError:
                 arguments = {}
             tool_calls.append({
-                "id": tc.get("id", ""),
+                "id": tc.get("id", "") or f"call_{idx}",
                 "type": tc.get("type", "function"),
                 "name": function.get("name", ""),
                 "arguments": arguments,
@@ -1416,9 +1511,21 @@ class BaseProvider:
 
 class OpenAIProvider(BaseProvider):
     def build_body(self, messages: List[Dict[str, Any]]) -> dict:
-        return {"model": self.model, "messages": messages, "tools": tool_schema(), "stream": False}
+        body = {"model": self.model, "messages": messages, "tools": tool_schema(), "stream": False}
+        if MANGO_MAX_OUTPUT > 0:
+            body["max_tokens"] = MANGO_MAX_OUTPUT
+        if MANGO_TEMPERATURE not in (None, ""):
+            body["temperature"] = float(MANGO_TEMPERATURE)
+        if MANGO_TOP_P not in (None, ""):
+            body["top_p"] = float(MANGO_TOP_P)
+        if MANGO_TOOL_CHOICE not in (None, ""):
+            body["tool_choice"] = MANGO_TOOL_CHOICE
+        return body
 
     def parse_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        usage = response.get("usage") or {}
+        usage.setdefault("prompt_tokens", 0)
+        usage.setdefault("completion_tokens", 0)
         choices = response.get("choices", [])
         if not choices:
             return {
@@ -1426,23 +1533,35 @@ class OpenAIProvider(BaseProvider):
                 "raw_message": {},
                 "content": "",
                 "reasoning_content": "",
+                "confirmation_content": "",
                 "tool_calls": [],
                 "has_tool_calls": False,
                 "model": response.get("model", ""),
-                "usage": response.get("usage", {})
+                "usage": usage
             }
         choice = choices[0]
         message = choice.get("message", {})
         tool_calls = self.normalize_tool_calls(message)
+        cleaned = self.clean_tagged_content(
+            content=message.get("content") or "",
+            reasoning=self.extract_reasoning(message),
+        )
+        raw_message = dict(message)
+        raw_message["content"] = cleaned["content"]
+        if cleaned["reasoning_content"]:
+            raw_message["reasoning_content"] = cleaned["reasoning_content"]
+        if cleaned["confirmation_content"]:
+            raw_message["confirmation_content"] = cleaned["confirmation_content"]
         return {
             "finish_reason": choice.get("finish_reason", "stop"),
-            "raw_message": message,
-            "content": message.get("content") or "",
-            "reasoning_content": self.extract_reasoning(message),
+            "raw_message": raw_message,
+            "content": cleaned["content"],
+            "reasoning_content": cleaned["reasoning_content"],
+            "confirmation_content": cleaned["confirmation_content"],
             "tool_calls": tool_calls,
             "has_tool_calls": bool(tool_calls),
             "model": response.get("model", ""),
-            "usage": response.get("usage", {})
+            "usage": usage
         }
 
 
@@ -1551,20 +1670,29 @@ class SystemPrompt:
 
     @staticmethod
     def _build_tool_guidance() -> List[str]:  # 工具使用指导
-        return [
+        lines = [
             "## Tool Selection\n\n",
             "Use the dedicated tool when one exists (read/write/edit/search/grep/search_memory/"
             "append_memory/attempt_completion). Reach for **bash** only when no dedicated tool fits.\n",
             "Use **edit** (not write) for small in-place changes; ensure `old` is unique or pass `all=true`.\n",
             "Use **search_memory** for long-term knowledge, **append_memory** only for "
             "architecture decisions / persistent preferences (not ephemeral context).\n",
-            "Use **view_image** for screenshots, UI mockups, error screens, and diagrams. "
-            "The `read` tool auto-routes image files (.png/.jpg/.jpeg/.gif/.webp) to vision, "
-            "but call `view_image` directly when the path is computed or generated.\n",
-            "Use **web_search** for the latest docs, news, or anything that requires the live web "
-            "beyond the local filesystem. Requires the `MANGO_SEARCH_API_KEY` env var. "
-            "Use sparingly — at most 3 times per user query to avoid excessive API calls.\n",
-            "Always finish with **attempt_completion** to present the final result.\n\n",]
+        ]
+        disabled = _configured_disabled_tools()
+        if "view_image" not in disabled:
+            lines.extend([
+                "Use **view_image** for screenshots, UI mockups, error screens, and diagrams. "
+                "The `read` tool auto-routes image files (.png/.jpg/.jpeg/.gif/.webp) to vision, "
+                "but call `view_image` directly when the path is computed or generated.\n",
+            ])
+        if "web_search" not in disabled:
+            lines.extend([
+                "Use **web_search** for the latest docs, news, or anything that requires the live web "
+                "beyond the local filesystem. Requires the `MANGO_SEARCH_API_KEY` env var. "
+                "Use sparingly — at most 3 times per user query to avoid excessive API calls.\n",
+            ])
+        lines.append("Always finish with **attempt_completion** to present the final result.\n\n")
+        return lines
 
     @staticmethod
     def _build_skills_guidance() -> List[str]:
@@ -1640,6 +1768,8 @@ def agent_loop(ctx: ContextManager, ctx_file_path: str, user_input: str):
 
         if response["reasoning_content"]:
             console.thinking(response["reasoning_content"])
+        if response.get("confirmation_content"):
+            console.confirmation(response["confirmation_content"])
         if (response["content"] and
                 not any(tc["name"] == "attempt_completion" for tc in response.get("tool_calls", []))):
             console.output(response["content"])
